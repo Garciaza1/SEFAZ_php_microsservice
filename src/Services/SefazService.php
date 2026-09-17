@@ -4,6 +4,7 @@ namespace App\Services;
 
 use NFePHP\NFe\Make;
 use NFePHP\NFe\Tools;
+use NFePHP\NFe\Complements;
 use NFePHP\Common\Certificate;
 use NFePHP\DA\NFe\Danfe;
 use Exception;
@@ -20,10 +21,10 @@ class SefazService
         // 1. Configuração Dinâmica
         $config = [
             "atualizacao" => date('Y-m-d H:i:s'),
-            "tpAmb" => $fiscal['environment'],
-            "razaosocial" => $fiscal['company_name'],
-            "siglaUF" => $fiscal['state'],
-            "cnpj" => preg_replace('/[^0-9]/', '', $fiscal['document']),
+            "tpAmb" => (int)($fiscal['environment'] ?? 2),
+            "razaosocial" => $fiscal['company_name'] ?? '',
+            "siglaUF" => $fiscal['state'] ?? 'SP',
+            "cnpj" => preg_replace('/[^0-9]/', '', $fiscal['document'] ?? ''),
             "schemes" => "PL_009_V4",
             "versao" => "4.00",
             "tokenIBPT" => "",
@@ -31,49 +32,65 @@ class SefazService
             "CSCid" => $fiscal['csc_id'] ?? ""
         ];
 
-        // 2. Proteção de Certificado (Lê localmente se for arquivo do R2)
+        // 2. Leitura do Certificado Digital A1
         if (empty($fiscal['certificate_base64']) || empty($fiscal['certificate_pass'])) {
-            throw new Exception("Certificado base64 ou senha ausentes no payload.");
+            throw new Exception("Certificado digital ou senha ausentes na configuração fiscal.");
         }
 
-        $pfxContent = "";
+        $pfxContent = base64_decode($fiscal['certificate_base64']);
+        if (!$pfxContent) {
+            throw new Exception("Falha ao decodificar conteúdo base64 do certificado digital.");
+        }
+
         $password = $fiscal['certificate_pass'];
-
-        if (strpos($fiscal['certificate_base64'], 'private/tenants') !== false) {
-            $caminhoLocal = __DIR__ . '/../../certificado.pfx';
-            if (file_exists($caminhoLocal)) {
-                $pfxContent = file_get_contents($caminhoLocal);
-            } else {
-                throw new Exception("Certificado de teste não encontrado em: " . $caminhoLocal);
-            }
-        } else {
-            $pfxContent = base64_decode($fiscal['certificate_base64']);
+        try {
+            $certificate = Certificate::readPfx($pfxContent, $password);
+        } catch (\Exception $e) {
+            throw new Exception("Falha ao ler certificado digital A1: " . $e->getMessage());
         }
 
-        $certificate = Certificate::readPfx($pfxContent, $password);
         $this->tools = new Tools(json_encode($config), $certificate);
 
         $nfe = new Make();
 
+        $stdInfNFe = new \stdClass();
+        $stdInfNFe->versao = '4.00';
+        $stdInfNFe->Id = '';
+        $stdInfNFe->pk_nItem = null;
+        $nfe->taginfNFe($stdInfNFe);
+
         // 3. IDENTIFICAÇÃO E EMITENTE (Seu código original)
-        $std = new \stdClass();
-        $std->cUF = $this->getUfCode($fiscal['state']);
-        $std->natOp = 'VENDA DE MERCADORIA';
-        $std->mod = 55;
-        $std->serie = $fiscal['nfe_series'];
-        $std->nNF = $fiscal['next_nfe_num'];
-        $std->dhEmi = date('Y-m-d\TH:i:sP');
-        $std->tpNF = 1;
-        $std->idDest = ($fiscal['state'] === $customer['state']) ? 1 : 2;
-        $std->cMunFG = $fiscal['city_code_ibge'];
-        $std->tpAmb = $fiscal['environment'];
-        $nfe->tagide($std);
+        $stdIde = new \stdClass();
+        $stdIde->cUF = $this->getUfCode($fiscal['state']); // GARANTA QUE ISSO NÃO VOLTA NULL
+        $stdIde->natOp = 'VENDA DE MERCADORIA';
+        $stdIde->mod = 55;
+        $stdIde->serie = $fiscal['nfe_series'];
+        $stdIde->nNF = $fiscal['next_nfe_num'];
+        $stdIde->dhEmi = date('Y-m-d\TH:i:sP');
+        $stdIde->tpNF = 1;
+        $stdIde->idDest = ($fiscal['state'] === $customer['state']) ? 1 : 2;
+        $stdIde->cMunFG = $fiscal['city_code_ibge'];
+        $stdIde->tpImp = 1;
+        $stdIde->tpEmis = 1;
+        $stdIde->tpAmb = $fiscal['environment'];
+        $stdIde->finNFe = 1; // 1 = NF-e normal
+        $stdIde->indFinal = 1; // 1 = Consumidor Final (obrigatório se a IE do destinatário for 9)
+        $stdIde->indPres = 2; // 2 = Operação pela Internet
+        $stdIde->procEmi = 0; // 0 = Emissão de NF-e com aplicativo do contribuinte
+        $stdIde->verProc = '1.0.0'; // Versão do seu sistema
+        $nfe->tagide($stdIde);
 
         $std = new \stdClass();
         $std->CNPJ = preg_replace('/[^0-9]/', '', $fiscal['document']);
         $std->xNome = $fiscal['company_name'];
         if (!empty($fiscal['trade_name'])) $std->xFant = $fiscal['trade_name'];
-        $std->IE = preg_replace('/[^0-9]/', '', $fiscal['state_registration']);
+        // $std->IE = preg_replace('/[^0-9]/', '', $fiscal['state_registration']);
+        $ieLimpa = strtoupper(trim($fiscal['state_registration']));
+        if ($ieLimpa === 'ISENTO') {
+            $std->IE = 'ISENTO';
+        } else {
+            $std->IE = preg_replace('/[^0-9]/', '', $fiscal['state_registration']);
+        }
         $std->CRT = $fiscal['crt'];
         $nfe->tagemit($std);
 
@@ -119,32 +136,40 @@ class SefazService
         $totalProdutos = 0.0;
 
         $itens = !empty($payload['items']) ? $payload['items'] : [];
-        if (empty($itens)) {
-            $itens[] = ['sku' => '01', 'produto_nome' => 'Servico ou Produto Generico', 'quantidade' => 1, 'preco_unitario' => $payload['total_amount'], 'subtotal' => $payload['total_amount']];
+        $servicos = !empty($payload['services']) ? $payload['services'] : [];
+
+        $todosItens = array_merge($itens, $servicos);
+
+        if (empty($todosItens)) {
+            throw new Exception("A nota não pode ser emitida sem itens ou serviços.");
         }
 
-        foreach ($itens as $item) {
+        foreach ($todosItens as $item) {
+            // Se o Go não mandar, usamos valores de fallback para não quebrar o motor
+            $ncmItem = !empty($item['ncm']) ? preg_replace('/[^0-9]/', '', $item['ncm']) : '00000000';
+            $cfopItem = !empty($item['cfop']) ? preg_replace('/[^0-9]/', '', $item['cfop']) : '5102';
+            $csosnItem = !empty($item['csosn']) ? preg_replace('/[^0-9]/', '', $item['csosn']) : '102';
+
             // 1. Dados básicos do produto (TAG <prod>)
             $std = new \stdClass();
             $std->item = $contItem;
             $std->cProd = preg_replace('/[^a-zA-Z0-9]/', '', $item['sku'] ?? '001');
             $std->cEAN = 'SEM GTIN';
-            $std->xProd = $item['produto_nome'];
-            $std->NCM = '84713012';
-            $std->CFOP = ($fiscal['state'] === ($customer['state'] ?? 'SP')) ? '5102' : '6102';
+            $std->xProd = $item['produto_nome'] ?? $item['name'] ?? 'Produto sem nome';
+            $std->NCM = strlen($ncmItem) === 8 ? $ncmItem : '00000000'; // NCM deve ter exatos 8 dígitos
+            $std->CFOP = $cfopItem;
             $std->uCom = 'UN';
-            $std->qCom = $this->formatNum($item['quantidade']);
-            $std->vUnCom = $this->formatNum($item['preco_unitario']);
-            $std->vProd = $this->formatNum($item['subtotal']);
+            $std->qCom = $this->formatNum($item['quantidade'] ?? $item['quantity'] ?? 1);
+            $std->vUnCom = $this->formatNum($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
+            $std->vProd = $this->formatNum($item['subtotal'] ?? 0);
             $std->cEANTrib = 'SEM GTIN';
             $std->uTrib = 'UN';
-            $std->qTrib = $this->formatNum($item['quantidade']);
-            $std->vUnTrib = $this->formatNum($item['preco_unitario']);
+            $std->qTrib = $this->formatNum($item['quantidade'] ?? $item['quantity'] ?? 1);
+            $std->vUnTrib = $this->formatNum($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
             $std->indTot = 1;
             $nfe->tagprod($std);
 
             // 2. Inicializa o bloco de impostos do item (TAG <imposto>)
-            // Isso DEVE vir logo após o tagprod
             $std = new \stdClass();
             $std->item = $contItem;
             $nfe->tagimposto($std);
@@ -152,14 +177,14 @@ class SefazService
             // 3. ICMS para Simples Nacional (TAG <ICMS>)
             $std = new \stdClass();
             $std->item = $contItem;
-            $std->orig = 0;
-            $std->CSOSN = '102';
+            $std->orig = 0; // Você pode trazer a origem do Perfil Fiscal também!
+            $std->CSOSN = $csosnItem;
             $nfe->tagicmssn($std);
 
             // 4. PIS (TAG <PIS>) - Obrigatório para não dar erro de inicialização
             $std = new \stdClass();
             $std->item = $contItem;
-            $std->CST = '07'; // Isento
+            $std->CST = '07'; // Isento (Ajuste se o perfil exigir tributação de PIS)
             $std->vBC = '0.00';
             $std->pPIS = '0.00';
             $std->vPIS = '0.00';
@@ -174,7 +199,7 @@ class SefazService
             $std->vCOFINS = '0.00';
             $nfe->tagcofins($std);
 
-            $totalProdutos += (float)$item['subtotal'];
+            $totalProdutos += (float)($item['subtotal'] ?? 0);
             $contItem++;
         }
 
@@ -226,28 +251,123 @@ class SefazService
             $nfe->taginfAdic($std);
         }
 
-        // 9. ASSINATURA E GERAÇÃO
+        $errosMontagem = $nfe->getErrors();
+        if (!empty($errosMontagem)) {
+            // Em vez do Fatal Error, o PHP vai devolver um JSON legível pro Go com a tag que falhou!
+            throw new Exception("Faltam dados obrigatórios na montagem da NF-e: " . json_encode($errosMontagem));
+        }
+
+        // 9. ASSINATURA E GERAÇÃO DO XML
         try {
             $xmlNaoAssinado = $nfe->getXML();
             $xmlAssinado = $this->tools->signNFe($xmlNaoAssinado);
             $chaveAcesso = $nfe->getChave();
         } catch (\Exception $e) {
-            throw new Exception("Erro ao assinar XML: " . $e->getMessage());
+            throw new Exception("Erro ao assinar XML da NF-e: " . $e->getMessage());
         }
 
-        $protocolo = '1' . date('ymdHis') . rand(10, 99);
-        $xmlAutorizado = $this->mockProtocoloSefaz($xmlAssinado, $chaveAcesso, $protocolo);
+        // 10. ENVIO PARA OS WEBSERVICES DA SEFAZ
+        $idLote = str_pad((string)($fiscal['next_nfe_num'] ?? '1'), 15, '0', STR_PAD_LEFT);
+        $indSinc = 1; // 1 = Modo Síncrono (Padrão para 1 NF-e no lote na NF-e v4.00)
 
+        try {
+            $respEnvioXml = $this->tools->sefazEnviaLote([$xmlAssinado], $idLote, $indSinc);
+        } catch (\Exception $e) {
+            throw new Exception("Falha de comunicação com a SEFAZ: " . $e->getMessage());
+        }
+
+        $xmlEnvioObj = @simplexml_load_string($respEnvioXml);
+        if (!$xmlEnvioObj) {
+            throw new Exception("Resposta inválida ou vazia recebida da SEFAZ: " . substr((string)$respEnvioXml, 0, 500));
+        }
+
+        $cStatLote = (string) $xmlEnvioObj->cStat;
+        $xMotivoLote = (string) $xmlEnvioObj->xMotivo;
+
+        $xmlAutorizado = null;
+        $protocolo = '';
+        $mensagemSefaz = '';
+
+        // Caso 1: Modo Síncrono processado com sucesso pelo lote (cStat = 104)
+        if ($cStatLote === '104') {
+            $prot = $xmlEnvioObj->protNFe->infProt ?? null;
+            if (!$prot) {
+                throw new Exception("SEFAZ processou o lote, mas o protocolo não foi retornado: {$xMotivoLote}");
+            }
+            $cStatNota = (string) $prot->cStat;
+            $xMotivoNota = (string) $prot->xMotivo;
+            $protocolo = (string) $prot->nProt;
+            $mensagemSefaz = "[{$cStatNota}] {$xMotivoNota}";
+
+            if ($cStatNota === '100' || $cStatNota === '150') {
+                $xmlAutorizado = Complements::toAuthorize($xmlAssinado, $respEnvioXml);
+            } else {
+                throw new Exception("SEFAZ Rejeição: {$mensagemSefaz}");
+            }
+        }
+        // Caso 2: Modo Assíncrono - Lote recebido (cStat = 103)
+        else if ($cStatLote === '103') {
+            $nRec = (string) ($xmlEnvioObj->infRec->nRec ?? '');
+            if (empty($nRec)) {
+                throw new Exception("SEFAZ retornou lote recebido (103), mas sem número de recibo.");
+            }
+
+            $maxTentativas = 4;
+            $processado = false;
+
+            for ($i = 0; $i < $maxTentativas; $i++) {
+                sleep(2); // Aguarda 2 segundos antes de cada consulta
+                try {
+                    $respConsultaXml = $this->tools->sefazConsultaRecibo($nRec);
+                } catch (\Exception $e) {
+                    continue;
+                }
+
+                $xmlConsObj = @simplexml_load_string($respConsultaXml);
+                if (!$xmlConsObj) continue;
+
+                $cStatCons = (string) $xmlConsObj->cStat;
+                if ($cStatCons === '104') {
+                    $prot = $xmlConsObj->protNFe->infProt ?? null;
+                    if ($prot) {
+                        $cStatNota = (string) $prot->cStat;
+                        $xMotivoNota = (string) $prot->xMotivo;
+                        $protocolo = (string) $prot->nProt;
+                        $mensagemSefaz = "[{$cStatNota}] {$xMotivoNota}";
+
+                        if ($cStatNota === '100' || $cStatNota === '150') {
+                            $xmlAutorizado = Complements::toAuthorize($xmlAssinado, $respConsultaXml);
+                            $processado = true;
+                            break;
+                        } else {
+                            throw new Exception("SEFAZ Rejeição: {$mensagemSefaz}");
+                        }
+                    }
+                } else if ($cStatCons !== '105') { // 105 = Lote em processamento
+                    throw new Exception("SEFAZ Consulta Recibo: [{$cStatCons}] " . (string)$xmlConsObj->xMotivo);
+                }
+            }
+
+            if (!$processado) {
+                throw new Exception("Tempo limite esgotado ao aguardar processamento do recibo SEFAZ {$nRec}.");
+            }
+        }
+        // Caso 3: Rejeição direta do lote
+        else {
+            throw new Exception("SEFAZ Lote Rejeitado: [{$cStatLote}] {$xMotivoLote}");
+        }
+
+        // 11. GERAÇÃO DO DANFE EM PDF
         $pdfBase64 = "";
         try {
-            if (class_exists(Danfe::class)) {
+            if (class_exists(Danfe::class) && !empty($xmlAutorizado)) {
                 $danfe = new Danfe($xmlAutorizado);
                 $danfe->debugMode(false);
-                $danfe->creditsIntegratorFooter('Gerado por: Seu ERP SaaS');
+                $danfe->creditsIntegratorFooter('Gerado por: ERP SaaS');
                 $pdfBase64 = base64_encode($danfe->render());
             }
         } catch (\Exception $e) {
-            // Ignora erro de PDF
+            error_log("Aviso: Falha ao renderizar PDF do DANFE: " . $e->getMessage());
         }
 
         return [
@@ -256,7 +376,7 @@ class SefazService
             "chave_acesso" => $chaveAcesso,
             "recibo" => $protocolo,
             "status" => "autorizada",
-            "mensagem" => "Autorizado o uso da NF-e (Simulado)"
+            "mensagem" => $mensagemSefaz ?: "Autorizado o uso da NF-e"
         ];
     }
 
@@ -269,11 +389,5 @@ class SefazService
     private function formatNum($num): string
     {
         return number_format((float)$num, 2, '.', '');
-    }
-
-    private function mockProtocoloSefaz(string $xmlAssinado, string $chave, string $protocolo): string
-    {
-        $prot = "<protNFe versao=\"4.00\"><infProt><tpAmb>2</tpAmb><verAplic>SP_NFE_PL_009_V4</verAplic><chNFe>{$chave}</chNFe><dhRecbto>" . date('Y-m-d\TH:i:sP') . "</dhRecbto><nProt>{$protocolo}</nProt><digVal>mock</digVal><cStat>100</cStat><xMotivo>Autorizado o uso da NF-e</xMotivo></infProt></protNFe>";
-        return str_replace('</NFe>', '</NFe>' . $prot, $xmlAssinado);
     }
 }

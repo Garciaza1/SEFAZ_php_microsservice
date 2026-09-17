@@ -13,6 +13,7 @@ $app->addBodyParsingMiddleware();
 $app->addRoutingMiddleware();
 $app->addErrorMiddleware(true, true, true);
 
+//OPENSSL_ENABLE_SHA1_SIGNATURES=1 php -S 0.0.0.0:8000 -t public
 $app->get('/api/v1/health', function (Request $request, Response $response, $args) {
     $payload = json_encode([
         'status' => 'online',
