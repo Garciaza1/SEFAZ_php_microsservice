@@ -17,6 +17,17 @@ class SefazService
     {
         $fiscal = $payload['fiscal_config'];
         $customer = $payload['customer'];
+        $operacao = $payload['operacao'] ?? [];
+
+        // F5/F6: recusa ANTES de montar/assinar/enviar, com a lista do que falta.
+        $this->validarPayload($payload);
+
+        $natOp = trim((string)($operacao['natureza_operacao'] ?? '')) ?: 'VENDA DE MERCADORIA';
+        $indPres = $operacao['ind_pres'] ?? 2;
+        $indFinal = $operacao['ind_final'] ?? 1;
+        $modFrete = $operacao['mod_frete'] ?? 9;
+        $tPag = trim((string)($operacao['forma_pagamento'] ?? '')) ?: '01';
+        $indIEDest = (int)($customer['ind_ie_dest'] ?? 0) ?: 9;
 
         // 1. Configuração Dinâmica
         $config = [
@@ -62,7 +73,7 @@ class SefazService
         // 3. IDENTIFICAÇÃO E EMITENTE (Seu código original)
         $stdIde = new \stdClass();
         $stdIde->cUF = $this->getUfCode($fiscal['state']); // GARANTA QUE ISSO NÃO VOLTA NULL
-        $stdIde->natOp = 'VENDA DE MERCADORIA';
+        $stdIde->natOp = $natOp;
         $stdIde->mod = 55;
         $stdIde->serie = $fiscal['nfe_series'];
         $stdIde->nNF = $fiscal['next_nfe_num'];
@@ -74,8 +85,8 @@ class SefazService
         $stdIde->tpEmis = 1;
         $stdIde->tpAmb = $fiscal['environment'];
         $stdIde->finNFe = 1; // 1 = NF-e normal
-        $stdIde->indFinal = 1; // 1 = Consumidor Final (obrigatório se a IE do destinatário for 9)
-        $stdIde->indPres = 2; // 2 = Operação pela Internet
+        $stdIde->indFinal = (int)$indFinal; // 1 = Consumidor Final (obrigatório se a IE do destinatário for 9)
+        $stdIde->indPres = (int)$indPres; // 2 = Operação pela Internet (padrão)
         $stdIde->procEmi = 0; // 0 = Emissão de NF-e com aplicativo do contribuinte
         $stdIde->verProc = '1.0.0'; // Versão do seu sistema
         $nfe->tagide($stdIde);
@@ -110,10 +121,12 @@ class SefazService
         $docCliente = preg_replace('/[^0-9]/', '', $customer['document'] ?? '00000000000');
         if (strlen($docCliente) === 14) {
             $std->CNPJ = $docCliente;
-            $std->indIEDest = 9;
         } else {
             $std->CPF = str_pad($docCliente, 11, '0', STR_PAD_LEFT);
-            $std->indIEDest = 9;
+        }
+        $std->indIEDest = $indIEDest; // 1 contribuinte, 2 isento, 9 não contribuinte
+        if ($indIEDest === 1) {
+            $std->IE = preg_replace('/[^0-9]/', '', $customer['state_registration']);
         }
         $std->xNome = $fiscal['environment'] == 2 ? 'NF-E EMITIDA EM AMBIENTE DE HOMOLOGACAO - SEM VALOR FISCAL' : $customer['name'];
         $nfe->tagdest($std);
@@ -124,8 +137,9 @@ class SefazService
         $std->nro = $customer['number'] ?? 'S/N';
         if (!empty($customer['complement'])) $std->xCpl = $customer['complement'];
         $std->xBairro = $customer['district'] ?? 'Não informado';
-        // Se a cidade não tiver IBGE, usamos a do emitente temporariamente para não travar a validação
-        $std->cMun = $customer['city_code_ibge'] ?? $fiscal['city_code_ibge'];
+        // F6: sem fallback para o município do emitente — o código IBGE do destinatário é obrigatório
+        // (validado em validarPayload).
+        $std->cMun = preg_replace('/[^0-9]/', '', $customer['city_code_ibge']);
         $std->xMun = $customer['city'] ?? 'Não informado';
         $std->UF = $customer['state'] ?? 'SP';
         $std->CEP = preg_replace('/[^0-9]/', '', $customer['cep'] ?? '00000000');
@@ -134,6 +148,8 @@ class SefazService
         // 6. PRODUTOS E IMPOSTOS
         $contItem = 1;
         $totalProdutos = 0.0;
+        $totalPis = 0.0;
+        $totalCofins = 0.0;
 
         $itens = !empty($payload['items']) ? $payload['items'] : [];
         $servicos = !empty($payload['services']) ? $payload['services'] : [];
@@ -167,6 +183,10 @@ class SefazService
             $std->qTrib = $this->formatNum($item['quantidade'] ?? $item['quantity'] ?? 1);
             $std->vUnTrib = $this->formatNum($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
             $std->indTot = 1;
+            $cestItem = preg_replace('/[^0-9]/', '', (string)($item['cest'] ?? ''));
+            if (strlen($cestItem) === 7) {
+                $std->CEST = $cestItem;
+            }
             $nfe->tagprod($std);
 
             // 2. Inicializa o bloco de impostos do item (TAG <imposto>)
@@ -177,27 +197,39 @@ class SefazService
             // 3. ICMS para Simples Nacional (TAG <ICMS>)
             $std = new \stdClass();
             $std->item = $contItem;
-            $std->orig = 0; // Você pode trazer a origem do Perfil Fiscal também!
+            $std->orig = (int)($item['origin'] ?? 0); // F5: origem vem do perfil fiscal / formulário
             $std->CSOSN = $csosnItem;
             $nfe->tagicmssn($std);
 
-            // 4. PIS (TAG <PIS>) - Obrigatório para não dar erro de inicialização
+            // 4. PIS e 5. COFINS (F5: CST e alíquota vêm do perfil fiscal / formulário)
+            $baseItem = (float)($item['subtotal'] ?? 0);
+            $pisCst = $this->cstPisCofins($item['pis_cst'] ?? '07');
+            $pisRate = (float)($item['pis_rate'] ?? 0);
+            $vPis = $this->temAliquota($pisCst) ? round($baseItem * $pisRate / 100, 2) : 0.0;
             $std = new \stdClass();
             $std->item = $contItem;
-            $std->CST = '07'; // Isento (Ajuste se o perfil exigir tributação de PIS)
-            $std->vBC = '0.00';
-            $std->pPIS = '0.00';
-            $std->vPIS = '0.00';
+            $std->CST = $pisCst;
+            if ($this->temAliquota($pisCst)) {
+                $std->vBC = $this->formatNum($baseItem);
+                $std->pPIS = $this->formatNum($pisRate);
+                $std->vPIS = $this->formatNum($vPis);
+            }
             $nfe->tagpis($std);
 
-            // 5. COFINS (TAG <COFINS>) - Obrigatório
+            $cofCst = $this->cstPisCofins($item['cofins_cst'] ?? '07');
+            $cofRate = (float)($item['cofins_rate'] ?? 0);
+            $vCof = $this->temAliquota($cofCst) ? round($baseItem * $cofRate / 100, 2) : 0.0;
             $std = new \stdClass();
             $std->item = $contItem;
-            $std->CST = '07'; // Isento
-            $std->vBC = '0.00';
-            $std->pCOFINS = '0.00';
-            $std->vCOFINS = '0.00';
+            $std->CST = $cofCst;
+            if ($this->temAliquota($cofCst)) {
+                $std->vBC = $this->formatNum($baseItem);
+                $std->pCOFINS = $this->formatNum($cofRate);
+                $std->vCOFINS = $this->formatNum($vCof);
+            }
             $nfe->tagcofins($std);
+            $totalPis += $vPis;
+            $totalCofins += $vCof;
 
             $totalProdutos += (float)($item['subtotal'] ?? 0);
             $contItem++;
@@ -224,14 +256,14 @@ class SefazService
         $std->vII = 0.00;
         $std->vIPI = 0.00;
         $std->vIPIDevol = 0.00;
-        $std->vPIS = 0.00;
-        $std->vCOFINS = 0.00;
+        $std->vPIS = $this->formatNum($totalPis);
+        $std->vCOFINS = $this->formatNum($totalCofins);
         $std->vOutro = 0.00;
         $std->vNF = $this->formatNum($valorTotalNF);
         $nfe->tagICMSTot($std);
 
         $std = new \stdClass();
-        $std->modFrete = 9; // 9 = Sem frete embutido na transportadora
+        $std->modFrete = (int)$modFrete; // 9 = Sem frete (padrão)
         $nfe->tagtransp($std);
 
         $std = new \stdClass();
@@ -240,7 +272,7 @@ class SefazService
 
         $std = new \stdClass();
         $std->indPag = 0;
-        $std->tPag = '01'; // 01 = Dinheiro
+        $std->tPag = $tPag; // 01 = Dinheiro (padrão)
         $std->vPag = $this->formatNum($valorTotalNF);
         $nfe->tagdetPag($std);
 
@@ -378,6 +410,71 @@ class SefazService
             "status" => "autorizada",
             "mensagem" => $mensagemSefaz ?: "Autorizado o uso da NF-e"
         ];
+    }
+
+    /** CST de PIS/COFINS com 2 dígitos; vazio vira 07 (isento). */
+    private function cstPisCofins($cst): string
+    {
+        $cst = preg_replace('/[^0-9]/', '', (string)$cst);
+        return $cst === '' ? '07' : str_pad($cst, 2, '0', STR_PAD_LEFT);
+    }
+
+    /** CSTs com base de cálculo e alíquota (os demais, 04 a 09, só levam o CST). */
+    private function temAliquota(string $cst): bool
+    {
+        return !in_array($cst, ['04', '05', '06', '07', '08', '09'], true);
+    }
+
+    /**
+     * F5/F6: valida o que o Go enviou e lança erro descritivo (HTTP 422 no controller) em vez de
+     * deixar a SEFAZ rejeitar ou o NFePHP montar XML inválido.
+     */
+    private function validarPayload(array $payload): void
+    {
+        $c = $payload['customer'] ?? [];
+        $f = $payload['fiscal_config'] ?? [];
+        $p = [];
+
+        $ibge = preg_replace('/[^0-9]/', '', (string)($c['city_code_ibge'] ?? ''));
+        if ($ibge === '') {
+            $p[] = 'código IBGE do município do destinatário não informado';
+        } elseif (strlen($ibge) !== 7) {
+            $p[] = 'código IBGE do município do destinatário deve ter 7 dígitos';
+        } elseif (substr($ibge, 0, 2) !== (string)$this->getUfCode((string)($c['state'] ?? ''))) {
+            $p[] = "código IBGE {$ibge} não pertence à UF " . ($c['state'] ?? '');
+        }
+        $doc = preg_replace('/[^0-9]/', '', (string)($c['document'] ?? ''));
+        if (!in_array(strlen($doc), [11, 14], true)) {
+            $p[] = 'CPF/CNPJ do destinatário deve ter 11 ou 14 dígitos';
+        }
+        if (empty($c['street']) || empty($c['number']) || empty($c['district']) || empty($c['city'])) {
+            $p[] = 'endereço do destinatário incompleto (logradouro, número, bairro e cidade)';
+        }
+        if (strlen(preg_replace('/[^0-9]/', '', (string)($c['cep'] ?? ''))) !== 8) {
+            $p[] = 'CEP do destinatário deve ter 8 dígitos';
+        }
+        if ((int)($c['ind_ie_dest'] ?? 0) === 1 && empty($c['state_registration'])) {
+            $p[] = 'inscrição estadual do destinatário contribuinte não informada';
+        }
+        if (!in_array((int)($f['crt'] ?? 0), [1, 2], true)) {
+            $p[] = 'regime tributário (CRT ' . ($f['crt'] ?? '?') . ') ainda não suportado: apenas Simples Nacional (CRT 1 ou 2)';
+        }
+        foreach (array_merge($payload['items'] ?? [], $payload['services'] ?? []) as $item) {
+            $nome = $item['produto_nome'] ?? $item['name'] ?? $item['service_name'] ?? 'item';
+            if (strlen(preg_replace('/[^0-9]/', '', (string)($item['ncm'] ?? ''))) !== 8) {
+                $p[] = "'{$nome}': NCM deve ter 8 dígitos";
+            }
+            if (strlen(preg_replace('/[^0-9]/', '', (string)($item['cfop'] ?? ''))) !== 4) {
+                $p[] = "'{$nome}': CFOP deve ter 4 dígitos";
+            }
+            if (strlen(preg_replace('/[^0-9]/', '', (string)($item['csosn'] ?? ''))) !== 3) {
+                $p[] = "'{$nome}': CSOSN deve ter 3 dígitos";
+            }
+        }
+
+        if (!empty($p)) {
+            throw new \InvalidArgumentException('Dados incompletos para emitir a NF-e: ' . implode('; ', $p));
+        }
     }
 
     private function getUfCode(string $uf): int

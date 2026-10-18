@@ -31,6 +31,13 @@ class NfeController
                 "data" => $resultado
             ]));
             return $response->withHeader('Content-Type', 'application/json')->withStatus(200);
+        } catch (\InvalidArgumentException $e) {
+            // F5/F6: dado obrigatório ausente/inválido — não chegou à SEFAZ.
+            $response->getBody()->write(json_encode([
+                "error" => $e->getMessage(),
+                "code" => "NFE_VALIDATION"
+            ]));
+            return $response->withHeader('Content-Type', 'application/json')->withStatus(422);
         } catch (Exception $e) {
             $response->getBody()->write(json_encode([
                 "error" => "Erro no Gateway Fiscal (NFePHP): " . $e->getMessage()
