@@ -14,7 +14,7 @@ class NfeController
     {
         $payload = $request->getParsedBody();
 
-        error_log("DEBUG PAYLOAD: " . json_encode($payload));
+        // S3: nunca logar o payload. Ele leva certificate_base64 e certificate_pass já decifrados.
 
         // Validação estrita do que vem do Go
         if (empty($payload['order_id']) || empty($payload['fiscal_config']) || empty($payload['customer'])) {

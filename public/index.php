@@ -11,7 +11,33 @@ $app = AppFactory::create();
 
 $app->addBodyParsingMiddleware();
 $app->addRoutingMiddleware();
-$app->addErrorMiddleware(true, true, true);
+// Detalhe de erro só em desenvolvimento (APP_DEBUG=1): em produção o stack trace pode carregar
+// trechos do payload fiscal. logErrorDetails fica desligado pelo mesmo motivo.
+$app->addErrorMiddleware(getenv('APP_DEBUG') === '1', true, false);
+
+// S3: o Go é o único cliente deste serviço. Toda rota fiscal exige o token interno
+// compartilhado: INTERNAL_MICROSERVICE_TOKEN (o mesmo valor nos dois serviços), enviado pelo
+// Go em "Authorization: Bearer <token>". Sem token configurado o serviço recusa tudo (fail
+// closed) em vez de aceitar chamadas sem autenticação.
+$requireInternalToken = function (Request $request, \Psr\Http\Server\RequestHandlerInterface $handler) use ($app): Response {
+    $expected = (string) getenv('INTERNAL_MICROSERVICE_TOKEN');
+    $given = preg_match('/^Bearer\\s+(.+)$/i', $request->getHeaderLine('Authorization'), $m) ? trim($m[1]) : '';
+
+    $deny = function (int $status, string $msg) use ($app): Response {
+        $r = $app->getResponseFactory()->createResponse($status);
+        $r->getBody()->write(json_encode(['error' => $msg]));
+        return $r->withHeader('Content-Type', 'application/json');
+    };
+
+    if ($expected === '') {
+        error_log('INTERNAL_MICROSERVICE_TOKEN não configurado: recusando requisição fiscal');
+        return $deny(503, 'Serviço fiscal sem autenticação configurada');
+    }
+    if ($given === '' || !hash_equals($expected, $given)) {
+        return $deny(401, 'Não autorizado');
+    }
+    return $handler->handle($request);
+};
 
 //OPENSSL_ENABLE_SHA1_SIGNATURES=1 php -S 0.0.0.0:8000 -t public
 $app->get('/api/v1/health', function (Request $request, Response $response, $args) {
@@ -25,18 +51,8 @@ $app->get('/api/v1/health', function (Request $request, Response $response, $arg
     return $response->withHeader('Content-Type', 'application/json')->withStatus(200);
 });
 
-$app->post('/api/v1/nfe/emit', [NfeController::class, 'handleEmit']);
+$app->post('/api/v1/nfe/emit', [NfeController::class, 'handleEmit'])->add($requireInternalToken);
 
-$app->post('/api/v1/test', function (Request $request, Response $response, $args) {
-    $data = $request->getParsedBody();
-
-    $payload = json_encode([
-        'message' => 'Microsserviço PHP recebeu a ordem do Go!',
-        'dados_recebidos' => $data
-    ]);
-
-    $response->getBody()->write($payload);
-    return $response->withHeader('Content-Type', 'application/json')->withStatus(200);
-});
+// Rota /api/v1/test removida (S3): ecoava o payload recebido, que carrega o certificado A1.
 
 $app->run();
