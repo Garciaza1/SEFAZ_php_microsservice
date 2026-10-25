@@ -412,6 +412,142 @@ class SefazService
         ];
     }
 
+    /**
+     * F12: monta o Tools (certificado A1 + dados do emitente) para eventos sobre uma nota já autorizada.
+     * Mesma configuração da emissão, sem montar nota.
+     */
+    private function montarTools(array $fiscal): Tools
+    {
+        if (empty($fiscal['certificate_base64']) || empty($fiscal['certificate_pass'])) {
+            throw new \InvalidArgumentException("Certificado digital ou senha ausentes na configuração fiscal.");
+        }
+        $pfxContent = base64_decode((string) $fiscal['certificate_base64']);
+        if (!$pfxContent) {
+            throw new \InvalidArgumentException("Falha ao decodificar conteúdo base64 do certificado digital.");
+        }
+        try {
+            $certificate = Certificate::readPfx($pfxContent, (string) $fiscal['certificate_pass']);
+        } catch (\Exception $e) {
+            throw new \InvalidArgumentException("Falha ao ler certificado digital A1: " . $e->getMessage());
+        }
+        $config = [
+            "atualizacao" => date('Y-m-d H:i:s'),
+            "tpAmb" => (int) ($fiscal['environment'] ?? 2),
+            "razaosocial" => $fiscal['company_name'] ?? '',
+            "siglaUF" => $fiscal['state'] ?? 'SP',
+            "cnpj" => preg_replace('/[^0-9]/', '', $fiscal['document'] ?? ''),
+            "schemes" => "PL_009_V4",
+            "versao" => "4.00",
+            "tokenIBPT" => "",
+            "CSC" => "",
+            "CSCid" => ""
+        ];
+        return new Tools(json_encode($config), $certificate);
+    }
+
+    /**
+     * F12: cancela uma NF-e autorizada (evento 110111). A SEFAZ responde 135 (evento registrado) ou
+     * 155 (cancelamento fora de prazo aceito); qualquer outro cStat é recusa e vira registered=false,
+     * sem exceção, para o Go mostrar o motivo.
+     */
+    public function cancelarNota(array $payload): array
+    {
+        $fiscal = $payload['fiscal_config'] ?? [];
+        $chave = preg_replace('/[^0-9]/', '', (string) ($payload['access_key'] ?? ''));
+        $nProt = preg_replace('/[^0-9]/', '', (string) ($payload['protocol'] ?? ''));
+        $just = trim((string) ($payload['justification'] ?? ''));
+
+        if (strlen($chave) !== 44) {
+            throw new \InvalidArgumentException("Chave de acesso inválida: precisa ter 44 dígitos.");
+        }
+        if ($nProt === '') {
+            throw new \InvalidArgumentException("Protocolo de autorização ausente.");
+        }
+        $len = mb_strlen($just);
+        if ($len < 15 || $len > 255) {
+            throw new \InvalidArgumentException("A justificativa do cancelamento precisa ter de 15 a 255 caracteres.");
+        }
+
+        $tools = $this->montarTools($fiscal);
+
+        try {
+            $resp = $tools->sefazCancela($chave, $just, $nProt);
+        } catch (\InvalidArgumentException $e) {
+            throw $e;
+        } catch (\Exception $e) {
+            throw new Exception("Falha de comunicação com a SEFAZ: " . $e->getMessage());
+        }
+
+        $xml = @simplexml_load_string((string) $resp);
+        if (!$xml) {
+            throw new Exception("Resposta inválida ou vazia recebida da SEFAZ: " . substr((string) $resp, 0, 500));
+        }
+        $infEvento = $xml->retEvento->infEvento ?? null;
+        $cStat = (string) ($infEvento->cStat ?? $xml->cStat ?? '');
+        $xMotivo = (string) ($infEvento->xMotivo ?? $xml->xMotivo ?? '');
+        $registrado = in_array($cStat, ['135', '155'], true);
+
+        $eventoXml = '';
+        if ($registrado) {
+            try {
+                $eventoXml = (string) Complements::toAuthorize($tools->lastRequest, $resp);
+            } catch (\Exception $e) {
+                // o cancelamento já foi registrado na SEFAZ; sem o XML combinado guarda-se a resposta crua
+                error_log("Aviso: não foi possível montar o procEventoNFe: " . $e->getMessage());
+                $eventoXml = (string) $resp;
+            }
+        }
+
+        return [
+            "registered" => $registrado,
+            "cstat" => $cStat,
+            "motivo" => $xMotivo,
+            "event_protocol" => $registrado ? (string) ($infEvento->nProt ?? '') : '',
+            "event_xml" => $eventoXml,
+        ];
+    }
+
+    /**
+     * F12: consulta a nota pela chave. Serve para conferir se um cancelamento chegou à SEFAZ quando a
+     * resposta se perdeu (timeout). canceled=true se a nota consta como cancelada (cStat 101 ou 151)
+     * ou se há evento de cancelamento registrado (135/155).
+     */
+    public function consultarNota(array $payload): array
+    {
+        $fiscal = $payload['fiscal_config'] ?? [];
+        $chave = preg_replace('/[^0-9]/', '', (string) ($payload['access_key'] ?? ''));
+        if (strlen($chave) !== 44) {
+            throw new \InvalidArgumentException("Chave de acesso inválida: precisa ter 44 dígitos.");
+        }
+
+        $tools = $this->montarTools($fiscal);
+        try {
+            $resp = $tools->sefazConsultaChave($chave);
+        } catch (\Exception $e) {
+            throw new Exception("Falha de comunicação com a SEFAZ: " . $e->getMessage());
+        }
+
+        $xml = @simplexml_load_string((string) $resp);
+        if (!$xml) {
+            throw new Exception("Resposta inválida ou vazia recebida da SEFAZ: " . substr((string) $resp, 0, 500));
+        }
+
+        $cStat = (string) ($xml->cStat ?? '');
+        $cancelada = in_array($cStat, ['101', '151'], true);
+        foreach ($xml->procEventoNFe ?? [] as $proc) {
+            $inf = $proc->retEvento->infEvento ?? null;
+            if ($inf && (string) $inf->tpEvento === '110111' && in_array((string) $inf->cStat, ['135', '155'], true)) {
+                $cancelada = true;
+            }
+        }
+
+        return [
+            "cstat" => $cStat,
+            "motivo" => (string) ($xml->xMotivo ?? ''),
+            "canceled" => $cancelada,
+        ];
+    }
+
     /** CST de PIS/COFINS com 2 dígitos; vazio vira 07 (isento). */
     private function cstPisCofins($cst): string
     {

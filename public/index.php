@@ -52,6 +52,9 @@ $app->get('/api/v1/health', function (Request $request, Response $response, $arg
 });
 
 $app->post('/api/v1/nfe/emit', [NfeController::class, 'handleEmit'])->add($requireInternalToken);
+// F12: eventos sobre nota já autorizada
+$app->post('/api/v1/nfe/cancel', [NfeController::class, 'handleCancel'])->add($requireInternalToken);
+$app->post('/api/v1/nfe/consult', [NfeController::class, 'handleConsult'])->add($requireInternalToken);
 
 // Rota /api/v1/test removida (S3): ecoava o payload recebido, que carrega o certificado A1.
 
