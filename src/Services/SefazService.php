@@ -146,11 +146,6 @@ class SefazService
         $nfe->tagenderDest($std);
 
         // 6. PRODUTOS E IMPOSTOS
-        $contItem = 1;
-        $totalProdutos = 0.0;
-        $totalPis = 0.0;
-        $totalCofins = 0.0;
-
         $itens = !empty($payload['items']) ? $payload['items'] : [];
         $servicos = !empty($payload['services']) ? $payload['services'] : [];
 
@@ -160,7 +155,49 @@ class SefazService
             throw new Exception("A nota não pode ser emitida sem itens ou serviços.");
         }
 
+        // F11: a SEFAZ confere que desconto, frete e outras despesas do total são a soma dos itens
+        // (a sped-nfe também soma a partir deles). Cada item leva o próprio desconto (desconto_valor,
+        // calculado no Go) e uma parte, proporcional ao valor, do desconto geral do pedido, do frete e
+        // das outras despesas, mais o que foi informado só na emissão.
+        $linhas = [];
         foreach ($todosItens as $item) {
+            $q = (float)($item['quantidade'] ?? $item['quantity'] ?? 1);
+            $vUn = (float)($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
+            $vProd = (float)($item['subtotal'] ?? 0);
+            if ($vProd <= 0) {
+                $vProd = round($q * $vUn, 2);
+            }
+            $desc = min(max((float)($item['desconto_valor'] ?? 0), 0.0), $vProd);
+            $linhas[] = ['item' => $item, 'q' => $q, 'vUn' => $vUn, 'vProd' => round($vProd, 2), 'vDesc' => round($desc, 2)];
+        }
+
+        $descontoRateio = max(0.0, (float)($payload['order_discount'] ?? 0)) + max(0.0, (float)($payload['discount'] ?? 0));
+        $freteRateio = max(0.0, (float)($payload['order_freight'] ?? 0)) + max(0.0, (float)($payload['freight'] ?? 0));
+        $outrosRateio = max(0.0, (float)($payload['order_other'] ?? 0));
+
+        $liquidos = array_map(fn($l) => $l['vProd'] - $l['vDesc'], $linhas);
+        if (round($descontoRateio, 2) > round(array_sum($liquidos), 2)) {
+            throw new \InvalidArgumentException("O desconto da nota (R$ " . $this->formatNum($descontoRateio) . ") é maior que o valor dos itens.");
+        }
+        $partesDesconto = $this->ratear($descontoRateio, $liquidos);
+        $partesFrete = $this->ratear($freteRateio, $liquidos);
+        $partesOutros = $this->ratear($outrosRateio, $liquidos);
+
+        $contItem = 1;
+        $totalProdutos = 0.0;
+        $totalDesconto = 0.0;
+        $totalFrete = 0.0;
+        $totalOutros = 0.0;
+        $totalPis = 0.0;
+        $totalCofins = 0.0;
+
+        foreach ($linhas as $i => $linha) {
+            $item = $linha['item'];
+            $vProdItem = $linha['vProd'];
+            $vDescItem = round($linha['vDesc'] + $partesDesconto[$i], 2);
+            $vFreteItem = $partesFrete[$i];
+            $vOutroItem = $partesOutros[$i];
+
             // Se o Go não mandar, usamos valores de fallback para não quebrar o motor
             $ncmItem = !empty($item['ncm']) ? preg_replace('/[^0-9]/', '', $item['ncm']) : '00000000';
             $cfopItem = !empty($item['cfop']) ? preg_replace('/[^0-9]/', '', $item['cfop']) : '5102';
@@ -171,17 +208,26 @@ class SefazService
             $std->item = $contItem;
             $std->cProd = preg_replace('/[^a-zA-Z0-9]/', '', $item['sku'] ?? '001');
             $std->cEAN = 'SEM GTIN';
-            $std->xProd = $item['produto_nome'] ?? $item['name'] ?? 'Produto sem nome';
+            $std->xProd = $item['produto_nome'] ?? $item['name'] ?? $item['service_name'] ?? 'Produto sem nome';
             $std->NCM = strlen($ncmItem) === 8 ? $ncmItem : '00000000'; // NCM deve ter exatos 8 dígitos
             $std->CFOP = $cfopItem;
             $std->uCom = 'UN';
-            $std->qCom = $this->formatNum($item['quantidade'] ?? $item['quantity'] ?? 1);
-            $std->vUnCom = $this->formatNum($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
-            $std->vProd = $this->formatNum($item['subtotal'] ?? 0);
+            $std->qCom = $this->formatNum($linha['q']);
+            $std->vUnCom = $this->formatNum($linha['vUn']);
+            $std->vProd = $this->formatNum($vProdItem);
             $std->cEANTrib = 'SEM GTIN';
             $std->uTrib = 'UN';
-            $std->qTrib = $this->formatNum($item['quantidade'] ?? $item['quantity'] ?? 1);
-            $std->vUnTrib = $this->formatNum($item['preco_unitario'] ?? $item['unit_price'] ?? 0);
+            $std->qTrib = $this->formatNum($linha['q']);
+            $std->vUnTrib = $this->formatNum($linha['vUn']);
+            if ($vDescItem > 0) {
+                $std->vDesc = $this->formatNum($vDescItem);
+            }
+            if ($vFreteItem > 0) {
+                $std->vFrete = $this->formatNum($vFreteItem);
+            }
+            if ($vOutroItem > 0) {
+                $std->vOutro = $this->formatNum($vOutroItem);
+            }
             $std->indTot = 1;
             $cestItem = preg_replace('/[^0-9]/', '', (string)($item['cest'] ?? ''));
             if (strlen($cestItem) === 7) {
@@ -201,8 +247,9 @@ class SefazService
             $std->CSOSN = $csosnItem;
             $nfe->tagicmssn($std);
 
-            // 4. PIS e 5. COFINS (F5: CST e alíquota vêm do perfil fiscal / formulário)
-            $baseItem = (float)($item['subtotal'] ?? 0);
+            // 4. PIS e 5. COFINS (F5: CST e alíquota vêm do perfil fiscal / formulário). F11: a base
+            // é o valor do item menos o desconto (desconto incondicional não entra na receita).
+            $baseItem = max(0.0, round($vProdItem - $vDescItem, 2));
             $pisCst = $this->cstPisCofins($item['pis_cst'] ?? '07');
             $pisRate = (float)($item['pis_rate'] ?? 0);
             $vPis = $this->temAliquota($pisCst) ? round($baseItem * $pisRate / 100, 2) : 0.0;
@@ -231,14 +278,15 @@ class SefazService
             $totalPis += $vPis;
             $totalCofins += $vCof;
 
-            $totalProdutos += (float)($item['subtotal'] ?? 0);
+            $totalProdutos += $vProdItem;
+            $totalDesconto += $vDescItem;
+            $totalFrete += $vFreteItem;
+            $totalOutros += $vOutroItem;
             $contItem++;
         }
 
-        // 7. TOTAIS (Agora com Frete e Desconto!)
-        $frete = isset($payload['freight']) ? (float)$payload['freight'] : 0.00;
-        $desconto = isset($payload['discount']) ? (float)$payload['discount'] : 0.00;
-        $valorTotalNF = $totalProdutos + $frete - $desconto;
+        // 7. TOTAIS: a soma dos itens (F11).
+        $valorTotalNF = round($totalProdutos - $totalDesconto + $totalFrete + $totalOutros, 2);
 
         $std = new \stdClass();
         $std->vBC = 0.00;
@@ -250,15 +298,15 @@ class SefazService
         $std->vFCPST = 0.00;
         $std->vFCPSTRet = 0.00;
         $std->vProd = $this->formatNum($totalProdutos);
-        $std->vFrete = $this->formatNum($frete);
+        $std->vFrete = $this->formatNum($totalFrete);
         $std->vSeg = 0.00;
-        $std->vDesc = $this->formatNum($desconto);
+        $std->vDesc = $this->formatNum($totalDesconto);
         $std->vII = 0.00;
         $std->vIPI = 0.00;
         $std->vIPIDevol = 0.00;
         $std->vPIS = $this->formatNum($totalPis);
         $std->vCOFINS = $this->formatNum($totalCofins);
-        $std->vOutro = 0.00;
+        $std->vOutro = $this->formatNum($totalOutros);
         $std->vNF = $this->formatNum($valorTotalNF);
         $nfe->tagICMSTot($std);
 
@@ -270,10 +318,15 @@ class SefazService
         $std->vTroco = 0.00;
         $nfe->tagpag($std);
 
+        // F11: indPag (0 à vista, 1 a prazo) vem do Go; tPag 90 (sem pagamento) vai com valor zero e
+        // tPag 99 (outros) exige a descrição em xPag.
         $std = new \stdClass();
-        $std->indPag = 0;
-        $std->tPag = $tPag; // 01 = Dinheiro (padrão)
-        $std->vPag = $this->formatNum($valorTotalNF);
+        $std->indPag = (int)($operacao['ind_pag'] ?? 0) === 1 ? 1 : 0;
+        $std->tPag = $tPag;
+        if ($tPag === '99') {
+            $std->xPag = mb_substr(trim((string)($operacao['descricao_pagamento'] ?? '')) ?: 'Outros', 0, 60);
+        }
+        $std->vPag = $this->formatNum($tPag === '90' ? 0 : $valorTotalNF);
         $nfe->tagdetPag($std);
 
         // 8. INFORMAÇÕES COMPLEMENTARES / OBSERVAÇÕES (Novo!)
@@ -617,6 +670,40 @@ class SefazService
     {
         $ufs = ['RO' => 11, 'AC' => 12, 'AM' => 13, 'RR' => 14, 'PA' => 15, 'AP' => 16, 'TO' => 17, 'MA' => 21, 'PI' => 22, 'CE' => 23, 'RN' => 24, 'PB' => 25, 'PE' => 26, 'AL' => 27, 'SE' => 28, 'BA' => 29, 'MG' => 31, 'ES' => 32, 'RJ' => 33, 'SP' => 35, 'PR' => 41, 'SC' => 42, 'RS' => 43, 'MS' => 50, 'MT' => 51, 'GO' => 52, 'DF' => 53];
         return $ufs[strtoupper($uf)] ?? 35;
+    }
+
+    /**
+     * F11: divide $total entre as linhas na proporção de $pesos, em centavos, e põe a sobra do
+     * arredondamento na linha de maior peso, para a soma fechar exatamente. Sem peso, vai tudo
+     * na primeira linha.
+     *
+     * @param float[] $pesos
+     * @return float[]
+     */
+    private function ratear(float $total, array $pesos): array
+    {
+        $n = count($pesos);
+        $partes = array_fill(0, $n, 0.0);
+        $total = round($total, 2);
+        if ($n === 0 || $total <= 0) {
+            return $partes;
+        }
+        $soma = array_sum($pesos);
+        if ($soma <= 0) {
+            $partes[0] = $total;
+            return $partes;
+        }
+        $distribuido = 0.0;
+        $maior = 0;
+        foreach ($pesos as $i => $peso) {
+            $partes[$i] = floor($total * $peso / $soma * 100) / 100;
+            $distribuido += $partes[$i];
+            if ($peso > $pesos[$maior]) {
+                $maior = $i;
+            }
+        }
+        $partes[$maior] = round($partes[$maior] + ($total - $distribuido), 2);
+        return $partes;
     }
 
     private function formatNum($num): string
