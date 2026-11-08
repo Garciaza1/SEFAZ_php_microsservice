@@ -448,7 +448,7 @@ class SefazService
             if (class_exists(Danfe::class) && !empty($xmlAutorizado)) {
                 $danfe = new Danfe($xmlAutorizado);
                 $danfe->debugMode(false);
-                $danfe->creditsIntegratorFooter('Gerado por: ERP SaaS');
+                $danfe->creditsIntegratorFooter('Gerado por: Solar Systems');
                 $pdfBase64 = base64_encode($danfe->render());
             }
         } catch (\Exception $e) {
